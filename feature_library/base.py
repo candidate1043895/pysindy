@@ -320,6 +320,11 @@ class TensoredLibrary(BaseFeatureLibrary):
         length must equal the number of feature libraries.  Default is
         that all inputs are used for every library.
 
+    allowed_products : dict {int: list of int}, optional (default None)
+        Only for two libraries. Maps a term index of the first library to the
+        term indices of the second library it may multiply. Terms of the
+        first library not in the dict multiply every term. None = full product.
+
     Attributes
     ----------
     libraries_ : list of libraries
@@ -351,9 +356,11 @@ class TensoredLibrary(BaseFeatureLibrary):
         self,
         libraries: list,
         inputs_per_library: Optional[Sequence[Sequence[int]]] = None,
+        allowed_products: Optional[dict] = None,  # allowed_products
     ):
         self.libraries = libraries
         self.inputs_per_library = inputs_per_library
+        self.allowed_products = allowed_products  # allowed_products
 
     def _combinations(self, lib_i: AxesArray, lib_j: AxesArray) -> AxesArray:
         """
@@ -431,6 +438,20 @@ class TensoredLibrary(BaseFeatureLibrary):
         for osize in output_sizes:
             self.n_output_features_ *= osize
 
+        # allowed_products: keep only the permitted (lib0 term, lib1 term) products
+        self.kept_terms_ = None
+        if self.allowed_products is not None:
+            if len(fitted_libs) != 2:
+                raise ValueError("allowed_products only supports two libraries")
+            n_i, n_j = output_sizes
+            self.kept_terms_ = [
+                i * n_j + j
+                for i in range(n_i)
+                for j in range(n_j)
+                if i not in self.allowed_products or j in self.allowed_products[i]
+            ]
+            self.n_output_features_ = len(self.kept_terms_)
+
         # Save fitted libs
         self.libraries = fitted_libs
 
@@ -465,6 +486,8 @@ class TensoredLibrary(BaseFeatureLibrary):
                 )[0]
                 xp = self._combinations(xp, xp_i)
 
+            if getattr(self, "kept_terms_", None) is not None:  # allowed_products
+                xp = xp[..., self.kept_terms_]
             xp_full.append(xp)
         return xp_full
 
@@ -503,6 +526,8 @@ class TensoredLibrary(BaseFeatureLibrary):
             lib_i_feat_names = self.libraries[i].get_feature_names(cur_input_features)
             feature_names = self._name_combinations(feature_names, lib_i_feat_names)
 
+        if getattr(self, "kept_terms_", None) is not None:  # allowed_products
+            feature_names = [feature_names[k] for k in self.kept_terms_]
         return feature_names
 
     def calc_trajectory(self, diff_method, x, t):

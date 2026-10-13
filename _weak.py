@@ -587,6 +587,19 @@ class WeakSINDy(SINDy):
             self.sorted_lib_, zero_deriv, bool(time_deriv.any())
         )
 
+        # allowed_products: weak-form columns to keep (matches sorted_lib_ names)
+        kept_cols = []
+        offset = 0
+        for sublib in self.sorted_lib_.libraries:
+            kept = getattr(sublib, "kept_terms_", None)
+            if kept is not None:
+                n_full = int(np.prod([lb.n_output_features_ for lb in sublib.libraries]))
+                kept_cols.extend(offset + k for k in kept)
+            else:
+                n_full = sublib.n_output_features_
+                kept_cols.extend(range(offset, offset + n_full))
+            offset += n_full
+
         rhs_trajectories = []
         for it in zip(x_smooth, subdomain_specs, weights_per_deriv_op, strict=True):
             x_i, sub_spec, weight_map = it
@@ -609,6 +622,11 @@ class WeakSINDy(SINDy):
             weak_feats = AxesArray(
                 np.concatenate(weak_feats, axis=-1), {"ax_sample": 0, "ax_coord": 1}
             )
+            if weak_feats.shape[-1] != offset:  # allowed_products
+                raise RuntimeError(
+                    f"weak columns {weak_feats.shape[-1]} != library size {offset}"
+                )
+            weak_feats = weak_feats[..., kept_cols]  # allowed_products
             rhs_trajectories.append(weak_feats)
 
         # Fit the optimizer!
@@ -841,8 +859,8 @@ def _plan_weak_form(
                     (multiindices, np.zeros((len(multiindices), 1), dtype=int))
                 )
             #new_terms, new_namefuncs = _integrate_by_parts(multiindices)
-            diff_channels = getattr(sublib, "diff_channels", None)  # added by me
-            new_terms, new_namefuncs = _integrate_by_parts(multiindices, diff_channels)  # added by me
+            channels_per_term = sublib.channels_per_term_  # added by me (per derivative term)
+            new_terms, new_namefuncs = _integrate_by_parts(multiindices, channels_per_term)  # added by me
             
             term_namefuncs.extend(new_namefuncs)
             terms.extend(new_terms)
@@ -868,9 +886,9 @@ def _plan_weak_form(
             #new_terms, new_namefuncs = _integrate_product_by_parts(
             #    non_pde_lib, multiindices
             #)
-            diff_channels = getattr(pde_lib, "diff_channels", None)  # added by me
+            channels_per_term = pde_lib.channels_per_term_  # added by me (per derivative term)
             new_terms, new_namefuncs = _integrate_product_by_parts(  #a dded by me
-                non_pde_lib, multiindices, diff_channels
+                non_pde_lib, multiindices, channels_per_term
             )
             terms.extend(new_terms)
             term_namefuncs.extend(new_namefuncs)
@@ -1229,12 +1247,17 @@ def _dense_to_open_mesh(meshgrid: AxesArray) -> list[AxesArray]:
 
 def _integrate_by_parts(
     multiindices: Float2D,
-    diff_channels=None, # added by me
+    channels_per_term=None, # added by me: list of channel lists, one per deriv_op
 ) -> tuple[list[SemiTerm], list[Callable[[list[str]], list[str]]]]:
     """Move derivatives from each PDE term to test function"""
     terms: list[SemiTerm] = []
     term_namefuncs: list[Callable[[list[str]], list[str]]] = []
-    for deriv_op in multiindices:
+    if channels_per_term is None:  # added by me
+        channels_per_term = [None] * len(multiindices)
+    for deriv_op, chans in zip(multiindices, channels_per_term, strict=True):  # added by me
+        if chans is not None and len(chans) == 0:  # added by me: no channel gets this derivative
+            continue
+        diff_channels = None if chans is None else tuple(chans)  # added by me
         deriv_op = tuple(deriv_op)
         zeros = tuple(np.zeros_like(deriv_op))
         coeff = (-1) ** sum(deriv_op)
@@ -1247,7 +1270,7 @@ def _integrate_by_parts(
 def _integrate_product_by_parts(
     f_lib: BaseFeatureLibrary, 
     multiindices: Float2D, 
-    diff_channels=None, # added by me
+    channels_per_term=None, # added by me: list of channel lists, one per deriv_op
 ) -> tuple[list[Collection[SemiTerm]], list[Callable[[list[str]], list[str]]]]:
     r"""Move derivatives from each PDE term to test function
 
@@ -1281,7 +1304,12 @@ def _integrate_product_by_parts(
 
         return make_names
 
-    for deriv_op in multiindices:
+    if channels_per_term is None:  # added by me
+        channels_per_term = [None] * len(multiindices)
+    for deriv_op, chans in zip(multiindices, channels_per_term, strict=True):  # added by me
+        if chans is not None and len(chans) == 0:  # added by me: no channel gets this derivative
+            continue
+        diff_channels = None if chans is None else tuple(chans)  # added by me
         namefunc = mock_tensored_names(_MockPDELib(multiindices=[deriv_op]), f_lib)
         term_namefuncs.append(namefunc)
 
@@ -1322,6 +1350,9 @@ def _flatten_libraries(library: BaseFeatureLibrary) -> ConcatLibrary:
 
     if isinstance(library, TensoredLibrary):
         sublibs = [_flatten_libraries(lib1).libraries for lib1 in library.libraries]
+        allowed = getattr(library, "allowed_products", None)  # allowed_products
+        if allowed is not None and any(len(s) != 1 for s in sublibs):
+            raise ValueError("allowed_products needs exactly two plain libraries")
         sum_of_products: list[TensoredLibrary] = []
         for combo in iproduct(*sublibs):
             new_prod: list[BaseFeatureLibrary] = []
@@ -1332,7 +1363,9 @@ def _flatten_libraries(library: BaseFeatureLibrary) -> ConcatLibrary:
                     new_prod.append(term)
             pde_libs = [lib for lib in new_prod if isinstance(lib, PDELibrary)]
             non_pde_libs = [lib for lib in new_prod if lib not in pde_libs]
-            sum_of_products.append(TensoredLibrary(pde_libs + non_pde_libs))
+            sum_of_products.append(
+                TensoredLibrary(pde_libs + non_pde_libs, allowed_products=allowed)
+            )  # allowed_products
         return ConcatLibrary(sum_of_products)
 
     elif isinstance(library, ConcatLibrary):
